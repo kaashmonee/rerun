@@ -1,17 +1,27 @@
+use std::sync::Arc;
+
 use itertools::Itertools as _;
-use re_renderer::{LineDrawableBuilder, PickingLayerInstanceId, PointCloudBuilder};
+use nohash_hasher::IntMap;
+use re_byte_size::SizeBytes as _;
+use re_entity_db::EntityDb;
+use re_log::ResultExt as _;
+use re_log_types::hash::Hash64;
+use re_renderer::renderer::{
+    GpuPointCloud, PointCloudBatchFlags, PointCloudBatchInfo, PointCloudDrawData,
+};
+use re_renderer::{LineDrawableBuilder, PickingLayerInstanceId, PositionRadius};
 use re_sdk_types::archetypes::Points2D;
 use re_sdk_types::components::{ClassId, Color, KeypointId, Position2D, Radius, ShowLabels};
 use re_sdk_types::{Archetype as _, ArrowString};
 use re_view::{process_annotation_and_keypoint_slices, process_color_slice};
 use re_viewer_context::{
-    IdentifiedViewSystem, QueryContext, ViewClass as _, ViewContext, ViewContextCollection,
-    ViewQuery, ViewSystemExecutionError, VisualizerExecutionOutput, VisualizerQueryInfo,
-    VisualizerSystem, typed_fallback_for,
+    Cache, IdentifiedViewSystem, QueryContext, ResolvedAnnotationInfos, ViewClass as _,
+    ViewContext, ViewContextCollection, ViewQuery, ViewSystemExecutionError,
+    VisualizerExecutionOutput, VisualizerQueryInfo, VisualizerSystem, typed_fallback_for,
 };
 
-use super::SpatialViewVisualizerData;
 use super::utilities::{LabeledBatch, process_labels_2d};
+use super::{Keypoints, SpatialViewVisualizerData};
 use crate::SpaceKind;
 use crate::contexts::SpatialSceneVisualizerInstructionContext;
 use crate::visualizers::{load_keypoint_connections, process_radius_slice};
@@ -21,13 +31,229 @@ use crate::visualizers::{load_keypoint_connections, process_radius_slice};
 #[derive(Default)]
 pub struct Points2DVisualizer;
 
+/// Processed/computed point cloud data ready for rendering, plus its GPU upload.
+///
+/// This bundles together the results of processing raw component data
+/// (computing annotations, colors, radii, bounding boxes, etc.)
+/// so that it can be memoized based on `data.query_result_hash`.
+#[derive(re_byte_size::SizeBytes)]
+struct Points2DCpu {
+    /// 2D positions with Z=0, paired with their radii.
+    position_radii: Vec<PositionRadius>,
+
+    #[size_bytes(ignore)] // Lives entirely on the stack.
+    robust_bounds: re_renderer::RobustBounds,
+
+    picking_ids: Vec<PickingLayerInstanceId>,
+    annotation_infos: ResolvedAnnotationInfos,
+    keypoints: Keypoints,
+    colors: Vec<egui::Color32>,
+
+    /// Whether any point has a non-opaque color.
+    ///
+    /// Whether that actually leads to alpha-blended rendering also depends on the (per-frame)
+    /// app option, so it is not baked in here.
+    has_non_opaque_colors: bool,
+
+    /// The same point data residing on the GPU, uploaded once when this entry is created.
+    ///
+    /// `None` if there was nothing to upload or the upload failed.
+    #[size_bytes(ignore)] // VRAM, reported through `Points2DCache::vram_usage` instead.
+    gpu: Option<Arc<GpuPointCloud>>,
+}
+
+impl Points2DCpu {
+    fn compute(
+        ctx: &QueryContext<'_>,
+        entity_path: &re_log_types::EntityPath,
+        query: &ViewQuery<'_>,
+        ent_context: &SpatialSceneVisualizerInstructionContext<'_>,
+        data: &Points2DComponentData<'_>,
+    ) -> Self {
+        let num_instances = data.positions.len();
+        re_tracing::profile_function!(num_instances.to_string());
+
+        // The renderer draws 2D points as camera-facing circles in a Z=0 plane.
+        let positions = data
+            .positions
+            .iter()
+            .map(|p| glam::vec3(p.x(), p.y(), 0.0))
+            .collect_vec();
+
+        let picking_ids = (0..num_instances)
+            .map(|i| PickingLayerInstanceId(i as _))
+            .collect_vec();
+
+        let (annotation_infos, keypoints) = process_annotation_and_keypoint_slices(
+            query.latest_at,
+            num_instances,
+            positions.iter().copied(),
+            data.keypoint_ids,
+            data.class_ids,
+            &ent_context.annotations,
+        );
+
+        let radii = process_radius_slice(
+            ctx,
+            entity_path,
+            num_instances,
+            data.radii,
+            Points2D::descriptor_radii().component,
+        );
+        let colors = process_color_slice(
+            ctx,
+            Points2D::descriptor_colors().component,
+            num_instances,
+            &annotation_infos,
+            data.colors,
+        );
+
+        let robust_bounds = re_renderer::RobustBounds::from_points(&positions);
+        let position_radii = PositionRadius::from_many(&positions, &radii);
+        let has_non_opaque_colors = colors.iter().any(|c| !c.is_opaque());
+
+        // Uploading here (rather than per frame) is the whole point of this cache: the same
+        // textures are reused for as long as this entry lives.
+        let gpu = GpuPointCloud::new(
+            ctx.viewer_ctx().render_ctx(),
+            &position_radii,
+            &colors,
+            &picking_ids,
+        )
+        .ok_or_log_error()
+        .flatten()
+        .map(Arc::new);
+
+        Self {
+            position_radii,
+            robust_bounds,
+            picking_ids,
+            annotation_infos,
+            keypoints,
+            colors,
+            has_non_opaque_colors,
+            gpu,
+        }
+    }
+}
+
+// --- Points2DCache ---
+
+/// All the inputs that affect the output of [`Points2DCpu::compute`],
+/// beyond the point data itself (which is covered by `query_result_hash`).
+struct Points2DCacheKey {
+    /// Hash of the query results (positions, colors, radii, `class_ids`, etc.).
+    query_result_hash: Hash64,
+
+    /// The [`super::Annotations::row_id`] of the resolved annotation context.
+    /// Changes when the annotation context is re-logged.
+    annotation_row_id: re_chunk_store::RowId,
+}
+
+impl Points2DCacheKey {
+    fn hash(&self) -> Hash64 {
+        let Self {
+            query_result_hash,
+            annotation_row_id,
+        } = self;
+        Hash64::hash((query_result_hash, annotation_row_id))
+    }
+}
+
+struct Points2DCacheEntry {
+    cpu: Arc<Points2DCpu>,
+    last_used_generation: u64,
+}
+
+/// Caches [`Points2DCpu`] to avoid recomputing annotations, colors, radii, etc. -- and above all
+/// re-uploading the points to the GPU -- every frame.
+#[derive(Default)]
+pub struct Points2DCache {
+    cache: IntMap<Hash64, Points2DCacheEntry>,
+    generation: u64,
+}
+
+impl Points2DCache {
+    fn entry(
+        &mut self,
+        key: &Points2DCacheKey,
+        compute: impl FnOnce() -> Points2DCpu,
+    ) -> Arc<Points2DCpu> {
+        let hash = key.hash();
+        let entry = self
+            .cache
+            .entry(hash)
+            .or_insert_with(|| Points2DCacheEntry {
+                cpu: Arc::new(compute()),
+                last_used_generation: 0,
+            });
+        entry.last_used_generation = self.generation;
+        entry.cpu.clone()
+    }
+}
+
+impl Cache for Points2DCache {
+    fn name(&self) -> &'static str {
+        "Points2DCache"
+    }
+
+    fn begin_frame(&mut self) {
+        self.cache
+            .retain(|_, entry| entry.last_used_generation == self.generation);
+        self.generation += 1;
+    }
+
+    fn purge_memory(&mut self) {
+        self.cache.clear();
+    }
+
+    fn vram_usage(&self) -> re_byte_size::MemUsageTree {
+        re_byte_size::MemUsageTree::Bytes(
+            self.cache
+                .values()
+                .filter_map(|entry| entry.cpu.gpu.as_ref())
+                .map(|gpu| gpu.gpu_byte_size())
+                .sum(),
+        )
+    }
+
+    fn on_store_events(
+        &mut self,
+        _events: &[&re_chunk_store::ChunkStoreEvent],
+        _entity_db: &EntityDb,
+    ) {
+    }
+}
+
+impl re_byte_size::SizeBytes for Points2DCache {
+    fn heap_size_bytes(&self) -> u64 {
+        let Self {
+            cache,
+            generation: _,
+        } = self;
+        cache
+            .values()
+            .map(|entry| {
+                entry.cpu.as_ref().heap_size_bytes() + std::mem::size_of_val(&entry.cpu) as u64
+            })
+            .sum::<u64>()
+            + (cache.capacity() * std::mem::size_of::<(Hash64, Points2DCacheEntry)>()) as u64
+    }
+}
+
+impl re_byte_size::MemUsageTreeCapture for Points2DCache {
+    fn capture_mem_usage_tree(&self) -> re_byte_size::MemUsageTree {
+        re_byte_size::MemUsageTree::Bytes(self.total_size_bytes())
+    }
+}
+
 // NOTE: Do not put profile scopes in these methods. They are called for all entities and all
 // timestamps within a time range -- it's _a lot_.
 impl Points2DVisualizer {
     fn process_data<'a>(
         view_data: &mut SpatialViewVisualizerData,
         ctx: &QueryContext<'_>,
-        point_builder: &mut PointCloudBuilder<'_>,
+        point_draw_data: &mut Vec<PointCloudDrawData>,
         line_builder: &mut LineDrawableBuilder<'_>,
         query: &ViewQuery<'_>,
         ent_context: &SpatialSceneVisualizerInstructionContext<'_>,
@@ -45,66 +271,34 @@ impl Points2DVisualizer {
         for data in data {
             let num_instances = data.positions.len();
 
-            let positions = data
-                .positions
-                .iter()
-                .map(|p| glam::vec3(p.x(), p.y(), 0.0))
-                .collect_vec();
+            let cache_key = Points2DCacheKey {
+                query_result_hash: Hash64::hash((data.query_result_hash, data.index)),
+                annotation_row_id: ent_context.annotations.row_id(),
+            };
 
-            let picking_ids = (0..num_instances)
-                .map(|i| PickingLayerInstanceId(i as _))
-                .collect_vec();
-
-            let (annotation_infos, keypoints) = process_annotation_and_keypoint_slices(
-                query.latest_at,
-                num_instances,
-                positions.iter().copied(),
-                data.keypoint_ids,
-                data.class_ids,
-                &ent_context.annotations,
-            );
-
-            let radii = process_radius_slice(
-                ctx,
-                entity_path,
-                num_instances,
-                data.radii,
-                Points2D::descriptor_radii().component,
-            );
-            let colors = process_color_slice(
-                ctx,
-                Points2D::descriptor_colors().component,
-                num_instances,
-                &annotation_infos,
-                data.colors,
-            );
+            let cpu = ctx.store_ctx().memoizer(|c: &mut Points2DCache| {
+                c.entry(&cache_key, || {
+                    Points2DCpu::compute(ctx, entity_path, query, ent_context, &data)
+                })
+            });
 
             let world_from_obj = ent_context
                 .transform_info
                 .single_transform_required_for_entity(entity_path, Points2D::name())
                 .as_affine3a();
 
-            let has_transparency = transparency_enabled && colors.iter().any(|c| !c.is_opaque());
-            let robust_bounds = re_renderer::RobustBounds::from_points(&positions);
+            let has_transparency = transparency_enabled && cpu.has_non_opaque_colors;
 
-            {
-                let point_batch = point_builder
-                    .batch(entity_path.to_string())
-                    .depth_offset(ent_context.depth_offset)
-                    .flags(
-                        re_renderer::renderer::PointCloudBatchFlags::FLAG_DRAW_AS_CIRCLES
-                            | re_renderer::renderer::PointCloudBatchFlags::FLAG_ENABLE_SHADING,
-                    )
-                    .enable_alpha_blending(has_transparency)
-                    .world_from_obj(world_from_obj)
-                    .object_space_bounding_box(robust_bounds.exact)
-                    .outline_mask_ids(ent_context.highlight.overall)
-                    .picking_object_id(re_renderer::PickingLayerObjectId(entity_path.hash64()));
-
-                let mut point_range_builder =
-                    point_batch.add_points_2d(&positions, &radii, &colors, &picking_ids);
+            if let Some(gpu_cloud) = cpu.gpu.clone() {
+                let mut flags = PointCloudBatchFlags::FLAG_DRAW_AS_CIRCLES
+                    | PointCloudBatchFlags::FLAG_ENABLE_SHADING;
+                flags.set(
+                    PointCloudBatchFlags::FLAG_PREMULTIPLIED_ALPHA,
+                    has_transparency,
+                );
 
                 // Determine if there's any sub-ranges that need extra highlighting.
+                let mut additional_outline_mask_ids_vertex_ranges = Vec::new();
                 {
                     re_tracing::profile_scope!("marking additional highlight points");
                     #[expect(clippy::iter_over_hash_type)]
@@ -114,20 +308,41 @@ impl Points2DVisualizer {
                             < num_instances as u64)
                             .then_some(highlighted_key.get());
                         if let Some(highlighted_point_index) = highlighted_point_index {
-                            point_range_builder = point_range_builder
-                                .push_additional_outline_mask_ids_for_range(
-                                    highlighted_point_index as u32
-                                        ..highlighted_point_index as u32 + 1,
-                                    *instance_mask_ids,
-                                );
+                            additional_outline_mask_ids_vertex_ranges.push((
+                                highlighted_point_index as u32..highlighted_point_index as u32 + 1,
+                                *instance_mask_ids,
+                            ));
                         }
                     }
                 }
+
+                // Coplanar points alpha-blend in insertion order, so they never opt into the
+                // per-point back-to-front sort (hence no `sort_positions`/`sort_order_cache`).
+                point_draw_data.push(PointCloudDrawData::from_gpu_cloud(
+                    ctx.viewer_ctx().render_ctx(),
+                    &gpu_cloud,
+                    &[PointCloudBatchInfo {
+                        label: entity_path.to_string().into(),
+                        world_from_obj,
+                        flags,
+                        point_count: gpu_cloud.num_points(),
+                        first_point_index: Some(0),
+                        object_space_bounding_box: cpu.robust_bounds.exact,
+                        overall_outline_mask_ids: ent_context.highlight.overall,
+                        additional_outline_mask_ids_vertex_ranges,
+                        picking_object_id: re_renderer::PickingLayerObjectId(entity_path.hash64()),
+                        // 2D views stack entities by draw order, which is per-frame state.
+                        depth_offset: ent_context.depth_offset,
+                        sort_positions: None,
+                        sort_order_cache: None,
+                    }],
+                    re_view::SIZE_BOOST_IN_POINTS_FOR_POINT_OUTLINES,
+                ));
             }
 
             view_data.add_bounds(
                 entity_path.hash(),
-                robust_bounds,
+                cpu.robust_bounds,
                 world_from_obj,
                 SpaceKind::TwoD,
             );
@@ -137,7 +352,7 @@ impl Points2DVisualizer {
                 &ent_context.annotations,
                 world_from_obj,
                 entity_path,
-                &keypoints,
+                &cpu.keypoints,
             )?;
 
             view_data.ui_labels.extend(process_labels_2d(
@@ -145,14 +360,14 @@ impl Points2DVisualizer {
                     entity_path,
                     visualizer_instruction: ent_context.visualizer_instruction,
                     num_instances,
-                    overall_position: robust_bounds.exact.center().truncate(),
+                    overall_position: cpu.robust_bounds.exact.center().truncate(),
                     instance_positions: data.positions.iter().map(|p| glam::vec2(p.x(), p.y())),
                     labels: &data.labels,
-                    colors: &colors,
+                    colors: &cpu.colors,
                     show_labels: data.show_labels.unwrap_or_else(|| {
                         typed_fallback_for(ctx, Points2D::descriptor_show_labels().component)
                     }),
-                    annotation_infos: &annotation_infos,
+                    annotation_infos: &cpu.annotation_infos,
                 },
                 world_from_obj,
             ));
@@ -166,6 +381,9 @@ impl Points2DVisualizer {
 
 #[doc(hidden)] // Public for benchmarks
 pub struct Points2DComponentData<'a> {
+    pub index: (re_log_types::TimeInt, re_chunk_store::RowId),
+    pub query_result_hash: Hash64,
+
     // Point of views
     pub positions: &'a [Position2D],
 
@@ -213,10 +431,8 @@ impl VisualizerSystem for Points2DVisualizer {
         let mut view_data = SpatialViewVisualizerData::default();
         let output = VisualizerExecutionOutput::default();
 
-        let mut point_builder = PointCloudBuilder::new(ctx.viewer_ctx.render_ctx());
-        point_builder.radius_boost_in_ui_points_for_outlines(
-            re_view::SIZE_BOOST_IN_POINTS_FOR_POINT_OUTLINES,
-        );
+        // One draw data per cached point cloud: each has its own, independently cached upload.
+        let mut point_draw_data = Vec::new();
 
         // We need lines from keypoints. The number of lines we'll have is harder to predict, so we'll
         // go with the dynamic allocation approach.
@@ -239,7 +455,7 @@ impl VisualizerSystem for Points2DVisualizer {
                     return Ok(());
                 }
 
-                let num_positions = all_positions
+                let num_positions: usize = all_positions
                     .chunks()
                     .iter()
                     .flat_map(|chunk| chunk.iter_slices::<[f32; 2]>())
@@ -250,7 +466,6 @@ impl VisualizerSystem for Points2DVisualizer {
                     return Ok(());
                 }
 
-                point_builder.reserve(num_positions)?;
                 let all_colors = results.iter_optional(Points2D::descriptor_colors().component);
                 let all_radii = results.iter_optional(Points2D::descriptor_radii().component);
                 let all_labels = results.iter_optional(Points2D::descriptor_labels().component);
@@ -260,6 +475,8 @@ impl VisualizerSystem for Points2DVisualizer {
                     results.iter_optional(Points2D::descriptor_keypoint_ids().component);
                 let all_show_labels =
                     results.iter_optional(Points2D::descriptor_show_labels().component);
+
+                let query_result_hash = results.query_result_hash();
 
                 let results_iter = re_query::range_zip_1x6(
                     all_positions.slice::<[f32; 2]>(),
@@ -272,7 +489,7 @@ impl VisualizerSystem for Points2DVisualizer {
                 )
                 .map(
                     |(
-                        _index,
+                        index,
                         positions,
                         colors,
                         radii,
@@ -282,6 +499,8 @@ impl VisualizerSystem for Points2DVisualizer {
                         show_labels,
                     )| {
                         Points2DComponentData {
+                            index,
+                            query_result_hash,
                             positions: bytemuck::cast_slice(positions),
                             colors: colors.map_or(&[], |colors| bytemuck::cast_slice(colors)),
                             radii: radii.map_or(&[], |radii| bytemuck::cast_slice(radii)),
@@ -300,7 +519,7 @@ impl VisualizerSystem for Points2DVisualizer {
                 Self::process_data(
                     &mut view_data,
                     ctx,
-                    &mut point_builder,
+                    &mut point_draw_data,
                     &mut line_builder,
                     view_query,
                     spatial_ctx,
@@ -310,10 +529,12 @@ impl VisualizerSystem for Points2DVisualizer {
         )?;
 
         Ok(output
-            .with_draw_data([
-                point_builder.into_draw_data()?.into(),
-                line_builder.into_draw_data()?.into(),
-            ])
+            .with_draw_data(
+                point_draw_data
+                    .into_iter()
+                    .map(Into::into)
+                    .chain([line_builder.into_draw_data()?.into()]),
+            )
             .with_visualizer_data(view_data))
     }
 }
