@@ -6,10 +6,14 @@ use nohash_hasher::IntMap;
 use parking_lot::Mutex;
 use re_byte_size::SizeBytes as _;
 use re_entity_db::EntityDb;
+use re_log::ResultExt as _;
 use re_log_types::hash::Hash64;
+use re_renderer::renderer::{
+    GaussianSplatBatchFlags, GaussianSplatBatchInfo, GaussianSplatDrawData, GpuGaussianSplats,
+};
 use re_renderer::{
-    GaussianShCoefficient, GaussianSplatBuilder, PickingLayerInstanceId, Rgba32Unmul,
-    SortOrderCache,
+    GaussianShCoefficient, GaussianSplatBuilder, PickingLayerInstanceId, RenderContext,
+    Rgba32Unmul, SortOrderCache,
 };
 use re_sdk_types::Archetype as _;
 use re_sdk_types::archetypes::GaussianSplats3D;
@@ -70,7 +74,8 @@ struct GaussianSplats3DComponentData<'a> {
 /// so that it can be memoized based on `data.query_hash`.
 #[derive(re_byte_size::SizeBytes)]
 struct GaussianSplats3DCpu {
-    centers: Vec<glam::Vec3>,
+    /// Shared so the renderer can sort against them without copying them per batch.
+    centers: Arc<Vec<glam::Vec3>>,
     scales: Vec<glam::Vec3>,
     rotations: Vec<glam::Quat>,
     colors: Vec<Rgba32Unmul>,
@@ -89,6 +94,21 @@ struct GaussianSplats3DCpu {
     /// memoization: when the underlying data changes, fresh (empty) caches are created
     /// automatically.
     sort_order_caches: Mutex<Vec<SortOrderCache>>,
+
+    /// The same gaussians residing on the GPU, uploaded on first use.
+    ///
+    /// Unlike the rest of this struct, the upload depends on the spherical harmonics degree,
+    /// which is a display setting rather than part of the cache key: it is therefore recorded
+    /// alongside, and the data re-uploaded if it changes.
+    #[size_bytes(ignore)]
+    // VRAM, reported through `GaussianSplats3DCache::vram_usage` instead.
+    gpu: Mutex<Option<UploadedSplats>>,
+}
+
+/// A [`GpuGaussianSplats`] together with the spherical harmonics degree it was uploaded at.
+struct UploadedSplats {
+    sh_num_coefficients: usize,
+    splats: Arc<GpuGaussianSplats>,
 }
 
 impl GaussianSplats3DCpu {
@@ -103,7 +123,7 @@ impl GaussianSplats3DCpu {
                 .collect_vec()
         };
 
-        let centers: Vec<glam::Vec3> = bytemuck::cast_slice(data.centers).to_vec();
+        let centers = Arc::new(bytemuck::cast_slice::<_, glam::Vec3>(data.centers).to_vec());
 
         let scales: Vec<glam::Vec3> = if data.scales.is_empty() {
             vec![glam::Vec3::splat(FALLBACK_SCALE); num_instances]
@@ -145,7 +165,7 @@ impl GaussianSplats3DCpu {
         let robust_bounds = {
             re_tracing::profile_scope_if!(100_000 < num_instances, "bounding_box");
             // Exclude near-invisible floater gaussians so they don't blow up the bounds.
-            let opaque_centers: Vec<glam::Vec3> = std::iter::zip(&centers, &colors)
+            let opaque_centers: Vec<glam::Vec3> = std::iter::zip(centers.iter(), &colors)
                 .filter(|(_, color)| MIN_OPACITY_FOR_BOUNDS <= color.0[3])
                 .map(|(center, _)| *center)
                 .collect();
@@ -165,7 +185,59 @@ impl GaussianSplats3DCpu {
             picking_ids,
             robust_bounds,
             sort_order_caches: Mutex::new(Vec::new()),
+            gpu: Mutex::new(None),
         }
+    }
+
+    /// The uploaded gaussians, uploading them if this is the first use at this degree.
+    ///
+    /// Returns `None` if there was nothing to upload or the upload failed.
+    fn gpu(
+        &self,
+        render_ctx: &RenderContext,
+        sh_num_coefficients: usize,
+    ) -> Option<Arc<GpuGaussianSplats>> {
+        let mut uploaded = self.gpu.lock();
+
+        if let Some(uploaded) = uploaded.as_ref()
+            && uploaded.sh_num_coefficients == sh_num_coefficients
+        {
+            return Some(uploaded.splats.clone());
+        }
+
+        re_tracing::profile_function!();
+
+        // Degree 0 is the base color alone, so no coefficients need uploading at all.
+        let sh_coefficients: &[[GaussianShCoefficient; 15]] = if sh_num_coefficients == 0 {
+            &[]
+        } else {
+            &self.sh_coefficients
+        };
+
+        let mut builder = GaussianSplatBuilder::new(render_ctx);
+        builder.reserve(self.centers.len()).ok_or_log_error()?;
+        // A single batch: the per-frame batches are built on top of this one upload.
+        drop(builder.batch("gaussian_splats3d_upload").add_gaussians(
+            &self.centers,
+            &self.scales,
+            &self.rotations,
+            &self.colors,
+            sh_coefficients,
+            sh_num_coefficients,
+            &self.picking_ids,
+        ));
+
+        let splats = Arc::new(
+            GpuGaussianSplats::from_builder(builder)
+                .ok_or_log_error()
+                .flatten()?,
+        );
+        *uploaded = Some(UploadedSplats {
+            sh_num_coefficients,
+            splats: splats.clone(),
+        });
+
+        Some(splats)
     }
 
     /// The back-to-front sort cache for the given instance transform, creating it on first use.
@@ -224,6 +296,22 @@ impl Cache for GaussianSplats3DCache {
         self.cache.clear();
     }
 
+    fn vram_usage(&self) -> re_byte_size::MemUsageTree {
+        re_byte_size::MemUsageTree::Bytes(
+            self.cache
+                .values()
+                .filter_map(|entry| {
+                    entry
+                        .cpu
+                        .gpu
+                        .lock()
+                        .as_ref()
+                        .map(|uploaded| uploaded.splats.gpu_byte_size())
+                })
+                .sum(),
+        )
+    }
+
     fn on_store_events(
         &mut self,
         _events: &[&re_chunk_store::ChunkStoreEvent],
@@ -259,12 +347,13 @@ impl GaussianSplats3DVisualizer {
     fn process_data<'a>(
         view_data: &mut SpatialViewVisualizerData,
         ctx: &QueryContext<'_>,
-        splat_builder: &mut GaussianSplatBuilder<'_>,
+        splat_draw_data: &mut Vec<GaussianSplatDrawData>,
         ent_context: &SpatialSceneVisualizerInstructionContext<'_>,
         data: impl Iterator<Item = GaussianSplats3DComponentData<'a>>,
     ) {
         re_tracing::profile_function!();
         let entity_path = ctx.target_entity_path;
+        let render_ctx = ctx.viewer_ctx().render_ctx();
 
         for data in data {
             let num_instances = data.centers.len();
@@ -289,13 +378,20 @@ impl GaussianSplats3DVisualizer {
                     )
                 })
                 .num_coefficients();
-            // Degree 0 is the base color alone, so nothing needs uploading at all. Otherwise the
-            // (degree-independent) cache is truncated on the way to the GPU.
-            let sh_coefficients: &[[GaussianShCoefficient; 15]] = if sh_num_coefficients == 0 {
-                &[]
-            } else {
-                &cpu.sh_coefficients
+
+            // All instance transforms draw the same, singly-uploaded gaussians; only the
+            // per-batch state differs.
+            let Some(gpu_splats) = cpu.gpu(render_ctx, sh_num_coefficients) else {
+                continue;
             };
+            let mut flags = GaussianSplatBatchFlags::empty();
+            flags.set(
+                GaussianSplatBatchFlags::FLAG_HAS_SH_COEFFICIENTS,
+                gpu_splats.has_sh_coefficients(),
+            );
+
+            let mut batches =
+                Vec::with_capacity(ent_context.transform_info.target_from_instances().len());
 
             for (transform_index, world_from_obj) in ent_context
                 .transform_info
@@ -306,39 +402,36 @@ impl GaussianSplats3DVisualizer {
             {
                 re_tracing::profile_scope!("one-transform");
 
-                // Seed this frame's back-to-front sort from the previous frame's ordering. The
-                // cache lives in `cpu`, so it persists across frames (per transform, per view)
-                // and is reset automatically when the underlying data changes.
-                let mut splat_batch = splat_builder
-                    .batch(entity_path.to_string())
-                    .world_from_obj(world_from_obj)
-                    .object_space_bounding_box(cpu.robust_bounds.exact)
-                    .outline_mask_ids(ent_context.highlight.overall)
-                    .picking_object_id(re_renderer::PickingLayerObjectId(entity_path.hash64()))
-                    .sort_order(cpu.sort_order_cache(transform_index))
-                    .add_gaussians(
-                        &cpu.centers,
-                        &cpu.scales,
-                        &cpu.rotations,
-                        &cpu.colors,
-                        sh_coefficients,
-                        sh_num_coefficients,
-                        &cpu.picking_ids,
-                    );
-
                 // Determine if there's any sub-ranges that need extra highlighting.
+                let mut additional_outline_mask_ids_vertex_ranges = Vec::new();
                 #[expect(clippy::iter_over_hash_type)]
                 // Non-overlapping per-instance mask ranges.
                 for (highlighted_key, instance_mask_ids) in &ent_context.highlight.instances {
                     if highlighted_key.get() < num_instances as u64 {
                         let highlighted_index = highlighted_key.get() as u32;
-                        splat_batch = splat_batch.push_additional_outline_mask_ids_for_range(
-                            highlighted_index..highlighted_index + 1,
-                            *instance_mask_ids,
-                        );
+                        additional_outline_mask_ids_vertex_ranges
+                            .push((highlighted_index..highlighted_index + 1, *instance_mask_ids));
                     }
                 }
-                drop(splat_batch);
+
+                // Seed this frame's back-to-front sort from the previous frame's ordering. The
+                // cache lives in `cpu`, so it persists across frames (per transform, per view)
+                // and is reset automatically when the underlying data changes.
+                batches.push(GaussianSplatBatchInfo {
+                    label: entity_path.to_string().into(),
+                    world_from_obj,
+                    flags,
+                    sh_num_coefficients: gpu_splats.sh_num_coefficients(),
+                    gaussian_count: gpu_splats.num_gaussians(),
+                    // Every transform draws the entire, shared upload.
+                    first_gaussian_index: Some(0),
+                    object_space_bounding_box: cpu.robust_bounds.exact,
+                    overall_outline_mask_ids: ent_context.highlight.overall,
+                    additional_outline_mask_ids_vertex_ranges,
+                    picking_object_id: re_renderer::PickingLayerObjectId(entity_path.hash64()),
+                    sort_positions: Some(cpu.centers.clone()),
+                    sort_order_cache: Some(cpu.sort_order_cache(transform_index)),
+                });
 
                 view_data.add_bounds(
                     entity_path.hash(),
@@ -347,6 +440,12 @@ impl GaussianSplats3DVisualizer {
                     SpaceKind::ThreeD,
                 );
             }
+
+            splat_draw_data.push(GaussianSplatDrawData::from_gpu_splats(
+                render_ctx,
+                &gpu_splats,
+                &batches,
+            ));
         }
     }
 }
@@ -385,7 +484,8 @@ impl VisualizerSystem for GaussianSplats3DVisualizer {
         let mut view_data = SpatialViewVisualizerData::default();
         let output = VisualizerExecutionOutput::default();
 
-        let mut splat_builder = GaussianSplatBuilder::new(ctx.viewer_ctx.render_ctx());
+        // One draw data per cached gaussian cloud: each has its own, independently cached upload.
+        let mut splat_draw_data = Vec::new();
 
         use super::entity_iterator::process_archetype;
         process_archetype::<GaussianSplats3D, _, _>(
@@ -417,7 +517,6 @@ impl VisualizerSystem for GaussianSplats3DVisualizer {
                     return Ok(());
                 }
 
-                splat_builder.reserve(num_centers)?;
                 let all_scales =
                     results.iter_optional(GaussianSplats3D::descriptor_scales().component);
                 let all_quaternions =
@@ -470,7 +569,7 @@ impl VisualizerSystem for GaussianSplats3DVisualizer {
                 Self::process_data(
                     &mut view_data,
                     ctx,
-                    &mut splat_builder,
+                    &mut splat_draw_data,
                     spatial_ctx,
                     results_iter,
                 );
@@ -480,7 +579,7 @@ impl VisualizerSystem for GaussianSplats3DVisualizer {
         )?;
 
         Ok(output
-            .with_draw_data([splat_builder.into_draw_data()?.into()])
+            .with_draw_data(splat_draw_data.into_iter().map(Into::into))
             .with_visualizer_data(view_data))
     }
 }
