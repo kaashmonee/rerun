@@ -289,8 +289,11 @@ impl GaussianSplatBatchBuilder<'_, '_> {
         // Retain object-space centers so the batch can be sorted back-to-front every frame.
         {
             re_tracing::profile_scope!("sort_positions");
-            let sort_positions = self.batch_mut().sort_positions.get_or_insert_with(Vec::new);
-            sort_positions.extend_from_slice(centers);
+            let sort_positions = self
+                .batch_mut()
+                .sort_positions
+                .get_or_insert_with(|| std::sync::Arc::new(Vec::new()));
+            std::sync::Arc::make_mut(sort_positions).extend_from_slice(centers);
         }
 
         {

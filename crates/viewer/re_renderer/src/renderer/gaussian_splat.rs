@@ -35,7 +35,8 @@ use crate::transparent_sort::{
 use crate::view_builder::ViewBuilder;
 use crate::wgpu_resources::{
     BindGroupDesc, BindGroupEntry, BindGroupLayoutDesc, GpuBindGroup, GpuBindGroupLayoutHandle,
-    GpuRenderPipelineHandle, GpuRenderPipelinePoolAccessor, PipelineLayoutDesc, RenderPipelineDesc,
+    GpuRenderPipelineHandle, GpuRenderPipelinePoolAccessor, GpuTexture, PipelineLayoutDesc,
+    RenderPipelineDesc,
 };
 use crate::{
     DrawableCollector, GaussianSplatBuilder, Label, OutlineMaskPreference, include_shader_module,
@@ -267,9 +268,15 @@ pub struct GaussianSplatBatchInfo {
     pub sh_num_coefficients: u32,
 
     /// Number of gaussians covered by this batch.
-    ///
-    /// The batch will start with the next gaussian after the one the previous batch ended with.
     pub gaussian_count: u32,
+
+    /// Index of this batch's first gaussian in the shared data textures.
+    ///
+    /// `None` continues right after the gaussian the previous batch ended with, which is what
+    /// [`crate::GaussianSplatBuilder`] produces. Setting it explicitly lets several batches draw
+    /// overlapping ranges of a single upload, e.g. one batch per instance transform. The batch's
+    /// region in the SH texture follows from it, since a single upload has one coefficient stride.
+    pub first_gaussian_index: Option<u32>,
 
     /// Object-space bounding box of the gaussian centers in this batch.
     ///
@@ -292,7 +299,9 @@ pub struct GaussianSplatBatchInfo {
 
     /// Object-space centers of the gaussians in this batch, used to sort back-to-front
     /// on the CPU. Filled in automatically by [`crate::GaussianSplatBuilder`].
-    pub sort_positions: Option<Vec<glam::Vec3>>,
+    ///
+    /// Shared so that batches over a cached upload can reuse one copy of the centers.
+    pub sort_positions: Option<Arc<Vec<glam::Vec3>>>,
 
     /// Caller-owned cache for the back-to-front ordering, persisted across frames to seed the next
     /// sort for each view (a big speed-up).
@@ -311,6 +320,7 @@ impl Default for GaussianSplatBatchInfo {
             flags: GaussianSplatBatchFlags::empty(),
             sh_num_coefficients: 0,
             gaussian_count: 0,
+            first_gaussian_index: None,
             object_space_bounding_box: macaw::BoundingBox::nothing(),
             overall_outline_mask_ids: OutlineMaskPreference::NONE,
             additional_outline_mask_ids_vertex_ranges: Vec::new(),
@@ -327,11 +337,51 @@ pub enum GaussianSplatDrawDataError {
     FailedTransferringDataToGpu(#[from] crate::allocator::CpuWriteGpuReadError),
 }
 
-impl GaussianSplatDrawData {
-    /// Transforms and uploads gaussian data to be consumed by the GPU.
+/// Gaussian data residing on the GPU, shareable across frames and draw data instances.
+///
+/// Uploading is the expensive part of drawing a gaussian cloud, so callers whose data is
+/// unchanged from frame to frame should hold on to this and only rebuild the per-frame
+/// [`GaussianSplatDrawData`] around it via [`GaussianSplatDrawData::from_gpu_splats`].
+/// Keeping it alive keeps the data textures from being reclaimed by the resource pool.
+pub struct GpuGaussianSplats {
+    /// Binds all six data textures. Unlike the point cloud renderer's equivalent, this carries no
+    /// per-draw-data uniforms, so it can be built once alongside the upload.
+    bind_group_all_gaussians: GpuBindGroup,
+
+    /// Kept for [`Self::gpu_byte_size`]; the bind group is what keeps them alive.
     ///
-    /// Try to bundle all gaussians into a single draw data instance whenever possible.
-    pub fn new(builder: GaussianSplatBuilder<'_>) -> Result<Self, GaussianSplatDrawDataError> {
+    /// The SH texture is absent when no gaussian brought coefficients: the bind group then points
+    /// at the shared zeroed texture, which this upload does not own.
+    data_textures: Vec<GpuTexture>,
+
+    /// Number of gaussians that were actually uploaded.
+    num_gaussians: u32,
+
+    /// Coefficients stored per gaussian, i.e. the stride of the SH texture region.
+    sh_num_coefficients: u32,
+
+    /// Whether spherical harmonics coefficients were uploaded at all.
+    has_sh_coefficients: bool,
+}
+
+impl GpuGaussianSplats {
+    /// Uploads the gaussian data staged in `builder`, discarding its batches.
+    ///
+    /// Pass a builder with a single batch: [`Self::sh_num_coefficients`] and
+    /// [`Self::has_sh_coefficients`] describe that batch's upload, and are what the per-frame
+    /// batches built on top of it have to declare.
+    ///
+    /// Returns `None` if there are no gaussians to upload.
+    pub fn from_builder(
+        builder: GaussianSplatBuilder<'_>,
+    ) -> Result<Option<Self>, GaussianSplatDrawDataError> {
+        Ok(Self::split_builder(builder)?.0)
+    }
+
+    /// Uploads the staged gaussian data and hands back the batches that described it.
+    fn split_builder(
+        builder: GaussianSplatBuilder<'_>,
+    ) -> Result<(Option<Self>, Vec<GaussianSplatBatchInfo>), GaussianSplatDrawDataError> {
         re_tracing::profile_function!();
 
         let GaussianSplatBuilder {
@@ -345,68 +395,54 @@ impl GaussianSplatDrawData {
             batches,
         } = builder;
 
-        let renderer = ctx.renderer::<GaussianSplatRenderer>();
-        let batches = batches.as_slice();
-
         if position_scale_x_buffer.is_empty() {
-            return Ok(Self {
-                bind_group_all_gaussians: None,
-                batches: Vec::new(),
-                drawables: Arc::new(Mutex::new(SortedDrawables::default())),
-            });
+            return Ok((None, batches));
         }
 
-        let num_gaussians = position_scale_x_buffer.len();
-
-        let fallback_batches = [GaussianSplatBatchInfo {
-            label: "fallback_batches".into(),
-            gaussian_count: num_gaussians as _,
-            ..Default::default()
-        }];
-        let batches = if batches.is_empty() {
-            &fallback_batches
-        } else {
-            batches
-        };
+        let renderer = ctx.renderer::<GaussianSplatRenderer>();
+        let num_gaussians = position_scale_x_buffer.len() as u32;
 
         let position_scale_x_texture = position_scale_x_buffer.finish(
             wgpu::TextureFormat::Rgba32Float,
-            "GaussianSplatDrawData::position_scale_x_texture",
+            "GpuGaussianSplats::position_scale_x_texture",
         )?;
         let rotation_texture = rotation_buffer.finish(
             wgpu::TextureFormat::Rgba32Float,
-            "GaussianSplatDrawData::rotation_texture",
+            "GpuGaussianSplats::rotation_texture",
         )?;
         let scale_yz_texture = scale_yz_buffer.finish(
             wgpu::TextureFormat::Rg32Float,
-            "GaussianSplatDrawData::scale_yz_texture",
+            "GpuGaussianSplats::scale_yz_texture",
         )?;
-        let sh_texture_handle = if sh_buffer.is_empty() {
+        let has_sh_coefficients = !sh_buffer.is_empty();
+        let sh_texture = if has_sh_coefficients {
+            Some(sh_buffer.finish(
+                wgpu::TextureFormat::Rgba16Float,
+                "GpuGaussianSplats::sh_texture",
+            )?)
+        } else {
             // No batch has spherical harmonics, so nothing ever samples this texture -- but it
             // still has to be a valid, bindable texture.
-            ctx.texture_manager_2d.zeroed_texture_float().handle
-        } else {
-            sh_buffer
-                .finish(
-                    wgpu::TextureFormat::Rgba16Float,
-                    "GaussianSplatDrawData::sh_texture",
-                )?
-                .handle
+            None
         };
+        let sh_texture_handle = sh_texture.as_ref().map_or_else(
+            || ctx.texture_manager_2d.zeroed_texture_float().handle,
+            |texture| texture.handle,
+        );
         let color_texture = color_buffer.finish(
             wgpu::TextureFormat::Rgba8UnormSrgb,
-            "GaussianSplatDrawData::color_texture",
+            "GpuGaussianSplats::color_texture",
         )?;
         let picking_instance_id_texture = picking_instance_ids_buffer.finish(
             wgpu::TextureFormat::Rg32Uint,
-            "GaussianSplatDrawData::picking_instance_id_texture",
+            "GpuGaussianSplats::picking_instance_id_texture",
         )?;
 
         let bind_group_all_gaussians = ctx.gpu_resources.bind_groups.alloc(
             &ctx.device,
             &ctx.gpu_resources,
             &BindGroupDesc {
-                label: "GaussianSplatDrawData::bind_group_all_gaussians".into(),
+                label: "GpuGaussianSplats::bind_group_all_gaussians".into(),
                 entries: smallvec![
                     BindGroupEntry::DefaultTextureView(position_scale_x_texture.handle),
                     BindGroupEntry::DefaultTextureView(rotation_texture.handle),
@@ -418,6 +454,124 @@ impl GaussianSplatDrawData {
                 layout: renderer.bind_group_layout_all_gaussians,
             },
         );
+
+        // The stride is a property of the upload, so it is only well-defined for a single batch;
+        // multi-batch builders keep declaring it per batch and never go through the cached path.
+        let sh_num_coefficients = batches
+            .first()
+            .map_or(0, |batch_info| batch_info.sh_num_coefficients);
+
+        let data_textures = std::iter::chain(
+            [
+                position_scale_x_texture,
+                rotation_texture,
+                scale_yz_texture,
+                color_texture,
+                picking_instance_id_texture,
+            ],
+            sh_texture,
+        )
+        .collect();
+
+        Ok((
+            Some(Self {
+                bind_group_all_gaussians,
+                data_textures,
+                num_gaussians,
+                sh_num_coefficients,
+                has_sh_coefficients,
+            }),
+            batches,
+        ))
+    }
+
+    /// Number of gaussians that were actually uploaded.
+    #[inline]
+    pub fn num_gaussians(&self) -> u32 {
+        self.num_gaussians
+    }
+
+    /// Coefficients stored per gaussian, to be declared by every batch drawing this upload.
+    #[inline]
+    pub fn sh_num_coefficients(&self) -> u32 {
+        self.sh_num_coefficients
+    }
+
+    /// Whether spherical harmonics coefficients were uploaded at all.
+    #[inline]
+    pub fn has_sh_coefficients(&self) -> bool {
+        self.has_sh_coefficients
+    }
+
+    /// Approximate number of GPU bytes occupied by the data textures.
+    ///
+    /// Ignores padding introduced by the driver as well as any GPU-side compression.
+    pub fn gpu_byte_size(&self) -> u64 {
+        self.data_textures
+            .iter()
+            .map(|texture| {
+                let desc = &texture.creation_desc;
+                let num_texels = desc.size.width as u64 * desc.size.height as u64;
+                num_texels * desc.format.block_copy_size(None).unwrap_or(0) as u64
+            })
+            .sum()
+    }
+}
+
+impl GaussianSplatDrawData {
+    /// Transforms and uploads gaussian data to be consumed by the GPU.
+    ///
+    /// Try to bundle all gaussians into a single draw data instance whenever possible.
+    pub fn new(builder: GaussianSplatBuilder<'_>) -> Result<Self, GaussianSplatDrawDataError> {
+        re_tracing::profile_function!();
+
+        let ctx = builder.ctx;
+        let (gpu_splats, batches) = GpuGaussianSplats::split_builder(builder)?;
+        let Some(gpu_splats) = gpu_splats else {
+            return Ok(Self::empty());
+        };
+
+        Ok(Self::from_gpu_splats(ctx, &gpu_splats, &batches))
+    }
+
+    fn empty() -> Self {
+        Self {
+            bind_group_all_gaussians: None,
+            batches: Vec::new(),
+            drawables: Arc::new(Mutex::new(SortedDrawables::default())),
+        }
+    }
+
+    /// Builds the per-frame draw data for an already uploaded gaussian cloud.
+    ///
+    /// Only the per-batch state (transforms, outline masks, picking ids and the back-to-front
+    /// sorting) is rebuilt here; the gaussian data itself is reused as-is.
+    pub fn from_gpu_splats(
+        ctx: &RenderContext,
+        gpu_splats: &GpuGaussianSplats,
+        batches: &[GaussianSplatBatchInfo],
+    ) -> Self {
+        re_tracing::profile_function!();
+
+        let renderer = ctx.renderer::<GaussianSplatRenderer>();
+
+        let num_gaussians = gpu_splats.num_gaussians;
+        if num_gaussians == 0 {
+            return Self::empty();
+        }
+
+        let fallback_batches = [GaussianSplatBatchInfo {
+            label: "fallback_batches".into(),
+            gaussian_count: num_gaussians,
+            ..Default::default()
+        }];
+        let batches = if batches.is_empty() {
+            &fallback_batches
+        } else {
+            batches
+        };
+
+        let bind_group_all_gaussians = gpu_splats.bind_group_all_gaussians.clone();
 
         // Process batches
         let mut batches_internal = Vec::with_capacity(batches.len());
@@ -451,18 +605,29 @@ impl GaussianSplatDrawData {
 
             // The SH texture holds one region per batch that has coefficients, laid out
             // in batch order, so their offsets accumulate alongside the gaussian indices.
+            // A batch with an explicit start instead addresses a slice of a single shared upload,
+            // whose uniform stride puts its coefficients at `first_gaussian * sh_num_coefficients`.
+            let mut next_gaussian_index = 0;
+            let mut next_sh_texel = 0;
             let batch_offsets = batches
                 .iter()
-                .scan(
-                    (0, 0),
-                    |(first_gaussian_index, first_sh_texel), batch_info| {
-                        let offsets = (*first_gaussian_index, *first_sh_texel);
-                        *first_gaussian_index += batch_info.gaussian_count;
-                        *first_sh_texel +=
-                            batch_info.gaussian_count * batch_info.sh_num_coefficients;
-                        Some(offsets)
-                    },
-                )
+                .map(|batch_info| {
+                    let offsets = match batch_info.first_gaussian_index {
+                        Some(first_gaussian_index) => {
+                            let first_gaussian_index = first_gaussian_index.min(num_gaussians);
+                            (
+                                first_gaussian_index,
+                                first_gaussian_index * batch_info.sh_num_coefficients,
+                            )
+                        }
+                        None => (next_gaussian_index, next_sh_texel),
+                    };
+                    next_gaussian_index = offsets.0.saturating_add(batch_info.gaussian_count);
+                    next_sh_texel = offsets
+                        .1
+                        .saturating_add(batch_info.gaussian_count * batch_info.sh_num_coefficients);
+                    offsets
+                })
                 .collect::<Vec<_>>();
 
             let uniform_buffer_bindings = create_and_fill_uniform_buffer_batch(
@@ -517,12 +682,14 @@ impl GaussianSplatDrawData {
                 )
                 .into_iter();
 
-            let mut start_gaussian_for_next_batch = 0;
-            for (batch_info, uniform_buffer_binding) in
-                std::iter::zip(batches, uniform_buffer_bindings)
-            {
+            for ((batch_info, &(first_gaussian_index, _)), uniform_buffer_binding) in std::iter::zip(
+                std::iter::zip(batches, &batch_offsets),
+                uniform_buffer_bindings,
+            ) {
                 re_tracing::profile_scope!("batch");
-                let gaussian_range_end = start_gaussian_for_next_batch + batch_info.gaussian_count;
+                let gaussian_range_end = first_gaussian_index
+                    .saturating_add(batch_info.gaussian_count)
+                    .min(num_gaussians);
 
                 let mut active_phases = DrawPhase::Transparent | DrawPhase::PickingLayer;
                 if batch_info.overall_outline_mask_ids.is_some() {
@@ -557,7 +724,7 @@ impl GaussianSplatDrawData {
                         .sort_positions
                         .as_ref()
                         .map(|obj_positions| TransparentSort {
-                            object_positions: Arc::new(obj_positions.clone()),
+                            object_positions: obj_positions.clone(),
                             object_from_world: batch_info.world_from_obj.inverse(),
                             sort_order_cache: batch_info.sort_order_cache.clone(),
                         });
@@ -566,15 +733,16 @@ impl GaussianSplatDrawData {
                     ctx,
                     batch_info.label.clone(),
                     uniform_buffer_binding,
-                    start_gaussian_for_next_batch..gaussian_range_end,
+                    first_gaussian_index..gaussian_range_end,
                     active_phases,
                     center_world_position,
                     sort,
                 ));
 
                 for (range, _) in &batch_info.additional_outline_mask_ids_vertex_ranges {
-                    let range = (range.start + start_gaussian_for_next_batch)
-                        ..(range.end + start_gaussian_for_next_batch);
+                    // Ranges are relative to the batch, and must stay within what was uploaded.
+                    let range = (range.start + first_gaussian_index).min(gaussian_range_end)
+                        ..(range.end + first_gaussian_index).min(gaussian_range_end);
                     batches_internal.push(renderer.create_gaussian_splat_batch(
                         ctx,
                         format!("{:?} outline-only {:?}", batch_info.label, range).into(),
@@ -585,21 +753,14 @@ impl GaussianSplatDrawData {
                         None,
                     ));
                 }
-
-                start_gaussian_for_next_batch = gaussian_range_end;
-
-                // Should happen only if the number of gaussians was clamped.
-                if start_gaussian_for_next_batch >= num_gaussians as u32 {
-                    break;
-                }
             }
         }
 
-        Ok(Self {
+        Self {
             bind_group_all_gaussians: Some(bind_group_all_gaussians),
             batches: batches_internal,
             drawables: Arc::new(Mutex::new(SortedDrawables::default())),
-        })
+        }
     }
 }
 

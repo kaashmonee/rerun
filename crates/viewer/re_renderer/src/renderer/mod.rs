@@ -15,7 +15,7 @@ mod world_grid;
 pub use debug_overlay::{DebugOverlayDrawData, DebugOverlayError, DebugOverlayRenderer};
 pub use gaussian_splat::{
     GaussianSplatBatchFlags, GaussianSplatBatchInfo, GaussianSplatDrawData,
-    GaussianSplatDrawDataError, GaussianSplatRenderer, SH_TEXELS_PER_GAUSSIAN,
+    GaussianSplatDrawDataError, GaussianSplatRenderer, GpuGaussianSplats, SH_TEXELS_PER_GAUSSIAN,
 };
 pub use generic_skybox::{GenericSkyboxDrawData, GenericSkyboxType};
 pub use lines::{LineBatchInfo, LineDrawData, LineDrawDataError, LineStripFlags};
